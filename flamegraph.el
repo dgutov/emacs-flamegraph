@@ -55,6 +55,7 @@
 (require 'cl-lib)
 (require 'profiler)
 (require 'cursor-sensor)
+(require 'svg)
 
 (defgroup flamegraph nil
   "Flame graphs for the Emacs profiler."
@@ -83,6 +84,21 @@ Used by \\[flamegraph-find-source] for folded stacks whose frames embed a
 FILE:LINE location.  If nil, paths are resolved against the directory of
 the data file the graph was loaded from."
   :type '(choice (const :tag "Data file's directory" nil) directory))
+
+(defcustom flamegraph-renderer 'text
+  "Renderer used to draw flame graphs.
+The text renderer is interactive on graphical and text terminals.  The
+SVG renderer draws one image and is intended for graphical displays."
+  :type '(choice (const :tag "Text" text)
+                 (const :tag "SVG image" svg)))
+
+(defcustom flamegraph-svg-frame-height 18
+  "Height of one SVG frame row, in pixels."
+  :type 'natnum)
+
+(defcustom flamegraph-svg-font-size 12
+  "Font size used for SVG frame labels, in pixels."
+  :type 'natnum)
 
 ;;; Layout: call tree -> flat list of frames
 
@@ -180,6 +196,17 @@ The same NAME always maps to the same color, as in classic flame graphs."
                 (flamegraph--entry-name (profiler-calltree-entry node))
                 (profiler-format-number count)
                 (flamegraph--percent count total))))))
+
+(defvar flamegraph--grand-total)
+
+(defun flamegraph--frame-help (frame)
+  "Return help text for FRAME."
+  (let* ((node (flamegraph-frame-node frame))
+         (count (profiler-calltree-count node)))
+    (format "%s  —  %s (%s of total)"
+            (flamegraph--entry-name (profiler-calltree-entry node))
+            (profiler-format-number count)
+            (flamegraph--percent count flamegraph--grand-total))))
 
 ;;; Text renderer
 
@@ -285,6 +312,133 @@ MAX-DEPTH is the deepest row."
     (setq flamegraph--frame-positions
           (vconcat (sort positions #'<)))))
 
+;;; SVG renderer
+
+(defvar-local flamegraph--svg-hitboxes nil
+  "Vector of SVG hit boxes, sorted in navigation order.
+Each element has the form (X0 Y0 X1 Y1 FRAME).")
+
+(defvar-local flamegraph--current-frame nil
+  "Currently selected frame when using the SVG renderer.")
+
+(defvar-local flamegraph--current-frame-index 0
+  "Index of `flamegraph--current-frame' in `flamegraph--svg-hitboxes'.")
+
+(defun flamegraph--svg-label (name width)
+  "Return NAME truncated to fit WIDTH pixels in the SVG renderer."
+  (let* ((available (- width flamegraph-text-padding))
+         (char-px (max 1 (ceiling (* flamegraph-svg-font-size 0.6))))
+         (columns (/ (max 0 available) char-px)))
+    (truncate-string-to-width name columns)))
+
+(defun flamegraph--render-svg (frames max-depth)
+  "Draw FRAMES as one SVG image in the current buffer.
+MAX-DEPTH is the deepest row."
+  (let* ((total-px (flamegraph--canvas-width))
+         (row-height flamegraph-svg-frame-height)
+         (height (* (1+ max-depth) row-height))
+         (svg (svg-create total-px height))
+         (rows (make-vector (1+ max-depth) nil))
+         image-map hitboxes current current-index)
+    (dolist (frame frames)
+      (let ((x0 (round (* (flamegraph-frame-start frame) total-px)))
+            (x1 (round (* (+ (flamegraph-frame-start frame)
+                             (flamegraph-frame-width frame))
+                          total-px))))
+        (when (>= (- x1 x0) 1)
+          (push (list x0 x1 frame)
+                (aref rows (flamegraph-frame-depth frame))))))
+    (dotimes (depth (1+ max-depth))
+      (let ((y (* depth row-height)))
+        (dolist (seg (sort (aref rows depth) :key #'car))
+          (pcase-let* ((`(,x0 ,x1 ,frame) seg)
+                       (node (flamegraph-frame-node frame))
+                       (name (flamegraph--entry-name
+                              (profiler-calltree-entry node)))
+                       (color (flamegraph--color name))
+                       (width (- x1 x0))
+                       (label (flamegraph--svg-label name width)))
+            (push (list x0 y x1 (+ y row-height) frame) hitboxes)
+            (push (list (cons 'rect (cons (cons x0 y)
+                                          (cons x1 (+ y row-height))))
+                        'flamegraph-svg-frame
+                        (list 'help-echo (flamegraph--frame-help frame)
+                              'pointer 'hand))
+                  image-map)
+            (svg-rectangle svg x0 y width (1- row-height)
+                           :fill color :stroke "black" :stroke-width 0.5)
+            (when (and (> flamegraph-frame-border 0)
+                       (> x0 0)
+                       (> width (* 2 flamegraph-frame-border)))
+              (svg-rectangle svg x0 y flamegraph-frame-border (1- row-height)
+                             :fill (flamegraph--darken color 0.6)
+                             :stroke-width 0))
+            (unless (string-empty-p label)
+              (svg-text svg label
+                        :x (+ x0 flamegraph-text-padding)
+                        :y (+ y (floor (+ (/ row-height 2)
+                                          (/ flamegraph-svg-font-size 3))))
+                        :font-size flamegraph-svg-font-size
+                        :font-family "sans-serif"
+                        :fill "black"))))))
+    (setq hitboxes (vconcat (nreverse hitboxes))
+          flamegraph--svg-hitboxes hitboxes
+          flamegraph--frame-positions (if (> (length hitboxes) 0)
+                                          (vector (point))
+                                        []))
+    (when (> (length hitboxes) 0)
+      (let ((old-node (and flamegraph--current-frame
+                           (flamegraph-frame-node flamegraph--current-frame))))
+        (cl-loop for hit across hitboxes
+                 for i from 0
+                 when (eq (flamegraph-frame-node (nth 4 hit)) old-node)
+                 do (setq current (nth 4 hit)
+                          current-index i))
+        (unless current
+          (setq current (nth 4 (aref hitboxes 0))
+                current-index 0))))
+    (setq flamegraph--current-frame current
+          flamegraph--current-frame-index (or current-index 0))
+    (insert (propertize " "
+                        'display (svg-image svg :ascent 'center
+                                            :scale 1.0 :map image-map)
+                        'flamegraph-frame current
+                        'help-echo #'flamegraph--help-echo))
+    (insert "\n")))
+
+(defun flamegraph--svg-frame-at-event (event)
+  "Return the SVG frame clicked by EVENT, or nil."
+  (when (eq flamegraph-renderer 'svg)
+    (let* ((posn (event-end event))
+           (xy (and (posnp posn) (posn-object-x-y posn))))
+      (when xy
+        (let ((x (car xy))
+              (y (cdr xy))
+              found found-index)
+          (cl-loop for hit across flamegraph--svg-hitboxes
+                   for i from 0
+                   until found
+                   do (pcase-let ((`(,x0 ,y0 ,x1 ,y1 ,frame) hit))
+                        (when (and (<= x0 x) (< x x1)
+                                   (<= y0 y) (< y y1))
+                          (setq found frame
+                                found-index i))))
+          (when found
+            (setq flamegraph--current-frame found
+                  flamegraph--current-frame-index found-index))
+          found)))))
+
+(defun flamegraph--svg-goto (next)
+  "Move to the next SVG frame, or the previous one if NEXT is nil."
+  (let* ((len (length flamegraph--svg-hitboxes))
+         (index (+ flamegraph--current-frame-index (if next 1 -1))))
+    (if (and (>= index 0) (< index len))
+        (let ((frame (nth 4 (aref flamegraph--svg-hitboxes index))))
+          (setq flamegraph--current-frame frame
+                flamegraph--current-frame-index index)
+          (flamegraph--echo))
+      (message "No %s frame" (if next "next" "previous")))))
+
 ;;; Buffer state and drawing
 
 (defvar-local flamegraph--top nil
@@ -338,7 +492,11 @@ If POINT is non-nil, restore point there after drawing."
     (erase-buffer)
     (pcase-let ((`(,frames ,_total ,max-depth)
                  (flamegraph--frames root)))
-      (flamegraph--render-text frames max-depth))
+      (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+          (flamegraph--render-svg frames max-depth)
+        (setq flamegraph--current-frame nil
+              flamegraph--svg-hitboxes nil)
+        (flamegraph--render-text frames max-depth)))
     (setq header-line-format (flamegraph--header))
     ;; Each row begins with a background gap, so land on the first frame
     ;; unless the caller is restoring a previous view.
@@ -352,7 +510,9 @@ If POINT is non-nil, restore point there after drawing."
 
 (defun flamegraph--frame-at-point ()
   "Return the `flamegraph-frame' at point, or nil."
-  (get-text-property (point) 'flamegraph-frame))
+  (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+      flamegraph--current-frame
+    (get-text-property (point) 'flamegraph-frame)))
 
 (defun flamegraph--view-state ()
   "Return the current root and point as a restorable view state."
@@ -369,12 +529,15 @@ If POINT is non-nil, restore point there after drawing."
 (defun flamegraph-zoom (&optional event)
   "Zoom into the frame at point (or at EVENT), making it the new root."
   (interactive (list last-nonmenu-event))
-  (when (and event (not (eq event 'return)))
-    (let ((posn (event-end event)))
-      (when (posnp posn) (posn-set-point posn))))
-  (let ((frame (flamegraph--frame-at-point)))
-    (when frame
-      (flamegraph--goto-root (flamegraph-frame-node frame)))))
+  (let ((event-frame (and event
+                          (not (eq event 'return))
+                          (flamegraph--svg-frame-at-event event))))
+    (when (and event (not event-frame) (not (eq event 'return)))
+      (let ((posn (event-end event)))
+        (when (posnp posn) (posn-set-point posn))))
+    (let ((frame (or event-frame (flamegraph--frame-at-point))))
+      (when frame
+        (flamegraph--goto-root (flamegraph-frame-node frame))))))
 
 (defun flamegraph-zoom-out ()
   "Zoom out to the parent of the current root frame."
@@ -416,15 +579,17 @@ If POINT is non-nil, restore point there after drawing."
 
 (defun flamegraph--goto (next)
   "Move point to the next drawn frame, or the previous one if NEXT is nil."
-  (let ((pt (point)) (best nil))
-    (cl-loop for p across flamegraph--frame-positions do
-             (when (if next
-                       (and (> p pt) (or (null best) (< p best)))
-                     (and (< p pt) (or (null best) (> p best))))
-               (setq best p)))
-    (if best
-        (goto-char best)
-      (message "No %s frame" (if next "next" "previous")))))
+  (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+      (flamegraph--svg-goto next)
+    (let ((pt (point)) (best nil))
+      (cl-loop for p across flamegraph--frame-positions do
+               (when (if next
+                         (and (> p pt) (or (null best) (< p best)))
+                       (and (< p pt) (or (null best) (> p best))))
+                 (setq best p)))
+      (if best
+          (goto-char best)
+        (message "No %s frame" (if next "next" "previous"))))))
 
 (defun flamegraph-next ()
   "Move point to the next frame."
@@ -442,18 +607,19 @@ For Emacs functions this shows the usual function documentation.  For
 other frames it shows a report: the sampled source line in context, the
 frame's sample counts, and buttons to its caller and callees."
   (interactive (list last-nonmenu-event))
-  (when event
-    (let ((posn (event-end event)))
-      (when (posnp posn) (posn-set-point posn))))
-  (let ((frame (flamegraph--frame-at-point)))
-    (if (null frame)
-        (message "No frame at point")
-      (let* ((node (flamegraph-frame-node frame))
-             (entry (profiler-calltree-entry node)))
-        (if (or (and (symbolp entry) (fboundp entry)) (functionp entry))
-            (progn (require 'help-fns) (describe-function entry))
-          (flamegraph--describe-frame
-           node flamegraph--grand-total flamegraph--directory))))))
+  (let ((event-frame (and event (flamegraph--svg-frame-at-event event))))
+    (when (and event (not event-frame))
+      (let ((posn (event-end event)))
+        (when (posnp posn) (posn-set-point posn))))
+    (let ((frame (or event-frame (flamegraph--frame-at-point))))
+      (if (null frame)
+          (message "No frame at point")
+        (let* ((node (flamegraph-frame-node frame))
+               (entry (profiler-calltree-entry node)))
+          (if (or (and (symbolp entry) (fboundp entry)) (functionp entry))
+              (progn (require 'help-fns) (describe-function entry))
+            (flamegraph--describe-frame
+             node flamegraph--grand-total flamegraph--directory)))))))
 
 (defun flamegraph--entry-location (entry)
   "Extract a (FILE . LINE) source location embedded in ENTRY, or nil.
@@ -676,7 +842,9 @@ since this runs before that relocation happens."
   :doc "Keymap for `flamegraph-mode'."
   "RET"       #'flamegraph-zoom
   "<mouse-1>" #'flamegraph-zoom
+  "<flamegraph-svg-frame> <mouse-1>" #'flamegraph-zoom
   "<mouse-2>" #'flamegraph-describe
+  "<flamegraph-svg-frame> <mouse-2>" #'flamegraph-describe
   "u"         #'flamegraph-zoom-out
   "t"         #'flamegraph-zoom-reset
   "l"         #'flamegraph-back
@@ -696,7 +864,8 @@ since this runs before that relocation happens."
         truncate-lines t
         buffer-undo-list t
         left-fringe-width 0)
-  (cursor-intangible-mode 1)
+  (unless (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+    (cursor-intangible-mode 1))
   (add-hook 'post-command-hook #'flamegraph--echo nil t))
 
 ;;; Entry points
