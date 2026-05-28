@@ -100,6 +100,10 @@ SVG renderer draws one image and is intended for graphical displays."
   "Font size used for SVG frame labels, in pixels."
   :type 'natnum)
 
+(defcustom flamegraph-svg-frame-radius 3
+  "Corner radius of SVG frame rectangles, in pixels."
+  :type 'natnum)
+
 ;;; Layout: call tree -> flat list of frames
 
 (cl-defstruct (flamegraph-frame
@@ -366,13 +370,10 @@ MAX-DEPTH is the deepest row."
                               'pointer 'hand))
                   image-map)
             (svg-rectangle svg x0 y width (1- row-height)
-                           :fill color :stroke "black" :stroke-width 0.5)
-            (when (and (> flamegraph-frame-border 0)
-                       (> x0 0)
-                       (> width (* 2 flamegraph-frame-border)))
-              (svg-rectangle svg x0 y flamegraph-frame-border (1- row-height)
-                             :fill (flamegraph--darken color 0.6)
-                             :stroke-width 0))
+                           :fill color
+                           :rx flamegraph-svg-frame-radius
+                           :ry flamegraph-svg-frame-radius
+                           :stroke-width 0)
             (unless (string-empty-p label)
               (svg-text svg label
                         :x (+ x0 flamegraph-text-padding)
