@@ -55,7 +55,6 @@
 (require 'cl-lib)
 (require 'profiler)
 (require 'cursor-sensor)
-(require 'svg)
 
 (defgroup flamegraph nil
   "Flame graphs for the Emacs profiler."
@@ -351,16 +350,26 @@ FONT-SIZE is the SVG label font size in pixels."
          (columns (/ (max 0 available) char-px)))
     (truncate-string-to-width name columns)))
 
+(defun flamegraph--svg-escape (string)
+  "Escape STRING for use in SVG XML text or attributes."
+  (replace-regexp-in-string
+   "[&<>\"]"
+   (lambda (match)
+     (pcase (aref match 0)
+       (?& "&amp;")
+       (?< "&lt;")
+       (?> "&gt;")
+       (?\" "&quot;")))
+   string t t))
+
 (defun flamegraph--render-svg (frames max-depth)
-  "Draw FRAMES as one SVG image in the current buffer.
+  "Draw FRAMES as SVG images in the current buffer.
 MAX-DEPTH is the deepest row."
   (let* ((total-px (flamegraph--canvas-width))
          (font-size (flamegraph--svg-font-size))
          (row-height (max flamegraph-svg-frame-height (+ font-size 5)))
-         (height (* (1+ max-depth) row-height))
-         (svg (svg-create total-px height))
          (rows (make-vector (1+ max-depth) nil))
-         image-map hitboxes current current-index)
+         row-images image-map hitboxes current current-index positions)
     (dolist (frame frames)
       (let ((x0 (round (* (flamegraph-frame-start frame) total-px)))
             (x1 (round (* (+ (flamegraph-frame-start frame)
@@ -370,7 +379,11 @@ MAX-DEPTH is the deepest row."
           (push (list x0 x1 frame)
                 (aref rows (flamegraph-frame-depth frame))))))
     (dotimes (depth (1+ max-depth))
-      (let ((y (* depth row-height)))
+      (let ((svg-parts
+             (list (format "<svg width=\"%d\" height=\"%d\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\">"
+                           total-px row-height)))
+            (row-map nil)
+            (y (* depth row-height)))
         (dolist (seg (sort (aref rows depth) :key #'car))
           (pcase-let* ((`(,x0 ,x1 ,frame) seg)
                        (node (flamegraph-frame-node frame))
@@ -380,30 +393,32 @@ MAX-DEPTH is the deepest row."
                        (width (- x1 x0))
                        (label (flamegraph--svg-label name width font-size)))
             (push (list x0 y x1 (+ y row-height) frame) hitboxes)
-            (push (list (cons 'rect (cons (cons x0 y)
-                                          (cons x1 (+ y row-height))))
+            (push (list (cons 'rect (cons (cons x0 0)
+                                          (cons x1 row-height)))
                         'flamegraph-svg-frame
                         (list 'help-echo (flamegraph--frame-help frame)
                               'pointer 'hand))
-                  image-map)
-            (svg-rectangle svg x0 y width (1- row-height)
-                           :fill color
-                           :rx flamegraph-svg-frame-radius
-                           :ry flamegraph-svg-frame-radius
-                           :stroke-width 0)
+                  row-map)
+            (push (format "<rect x=\"%d\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"%s\" rx=\"%d\" ry=\"%d\"/>"
+                          x0 width (1- row-height) color
+                          flamegraph-svg-frame-radius
+                          flamegraph-svg-frame-radius)
+                  svg-parts)
             (unless (string-empty-p label)
-              (svg-text svg label
-                        :x (+ x0 flamegraph-text-padding)
-                        :y (+ y (floor (+ (/ row-height 2)
-                                          (/ font-size 3))))
-                        :font-size font-size
-                        :font-family "sans-serif"
-                        :fill "black"))))))
+              (push (format "<text x=\"%d\" y=\"%d\" font-size=\"%d\" font-family=\"sans-serif\" fill=\"black\">%s</text>"
+                            (+ x0 flamegraph-text-padding)
+                            (floor (+ (/ row-height 2) (/ font-size 3)))
+                            font-size
+                            (flamegraph--svg-escape label))
+                    svg-parts))))
+        (push "</svg>" svg-parts)
+        (push (list depth y
+                    (create-image (apply #'concat (nreverse svg-parts))
+                                  'svg t :ascent 'center
+                                  :scale 1.0 :map row-map))
+              row-images)))
     (setq hitboxes (vconcat (nreverse hitboxes))
-          flamegraph--svg-hitboxes hitboxes
-          flamegraph--frame-positions (if (> (length hitboxes) 0)
-                                          (vector (point))
-                                        []))
+          flamegraph--svg-hitboxes hitboxes)
     (when (> (length hitboxes) 0)
       (let ((old-node (and flamegraph--current-frame
                            (flamegraph-frame-node flamegraph--current-frame))))
@@ -417,12 +432,17 @@ MAX-DEPTH is the deepest row."
                 current-index 0))))
     (setq flamegraph--current-frame current
           flamegraph--current-frame-index (or current-index 0))
-    (insert (propertize " "
-                        'display (svg-image svg :ascent 'center
-                                            :scale 1.0 :map image-map)
-                        'flamegraph-frame current
-                        'help-echo #'flamegraph--help-echo))
-    (insert "\n")))
+    (dolist (row (nreverse row-images))
+      (pcase-let ((`(,depth ,y ,image) row))
+        (push (point) positions)
+        (insert (propertize " "
+                            'display image
+                            'flamegraph-frame current
+                            'flamegraph-svg-depth depth
+                            'flamegraph-svg-y-offset y
+                            'help-echo #'flamegraph--help-echo))
+        (insert "\n")))
+    (setq flamegraph--frame-positions (vconcat (nreverse positions)))))
 
 (defun flamegraph--svg-frame-at-event (event)
   "Return the SVG frame clicked by EVENT, or nil."
@@ -430,9 +450,13 @@ MAX-DEPTH is the deepest row."
     (let* ((posn (event-end event))
            (xy (and (posnp posn) (posn-object-x-y posn))))
       (when xy
-        (let ((x (car xy))
-              (y (cdr xy))
-              found found-index)
+        (let* ((point (and (posnp posn) (posn-point posn)))
+               (y-offset (if (integerp point)
+                             (or (get-text-property point 'flamegraph-svg-y-offset) 0)
+                           0))
+               (x (car xy))
+               (y (+ y-offset (cdr xy)))
+               found found-index)
           (cl-loop for hit across flamegraph--svg-hitboxes
                    for i from 0
                    until found
