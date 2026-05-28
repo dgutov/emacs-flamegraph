@@ -92,13 +92,14 @@ SVG renderer draws one image and is intended for graphical displays."
   :type '(choice (const :tag "Text" text)
                  (const :tag "SVG image" svg)))
 
-(defcustom flamegraph-svg-frame-height 18
-  "Height of one SVG frame row, in pixels."
+(defcustom flamegraph-svg-frame-height 14
+  "Minimum height of one SVG frame row, in pixels."
   :type 'natnum)
 
-(defcustom flamegraph-svg-font-size 12
-  "Font size used for SVG frame labels, in pixels."
-  :type 'natnum)
+(defcustom flamegraph-svg-font-size nil
+  "Font size used for SVG frame labels, in pixels.
+If nil, derive it from the current frame's default character height."
+  :type '(choice (const :tag "Default face height" nil) natnum))
 
 (defcustom flamegraph-svg-frame-radius 3
   "Corner radius of SVG frame rectangles, in pixels."
@@ -328,10 +329,25 @@ Each element has the form (X0 Y0 X1 Y1 FRAME).")
 (defvar-local flamegraph--current-frame-index 0
   "Index of `flamegraph--current-frame' in `flamegraph--svg-hitboxes'.")
 
-(defun flamegraph--svg-label (name width)
-  "Return NAME truncated to fit WIDTH pixels in the SVG renderer."
+(defun flamegraph--svg-font-size ()
+  "Return the SVG label font size in pixels."
+  (or flamegraph-svg-font-size
+      (let ((height (face-attribute 'default :height nil)))
+        (if (and (integerp height) (> height 10))
+            ;; Face heights are tenths of a point; SVG font sizes are CSS
+            ;; pixels, conventionally 96 DPI.  In practice librsvg text
+            ;; renders smaller than buffer text, so keep the automatic value
+            ;; no smaller than the size that visually matches the default face.
+            (max 28 (ceiling (* height 96) 720))
+          ;; `frame-char-height' can be tiny before a graphical frame has
+          ;; useful font metrics, so keep the automatic size readable.
+          (max 28 (frame-char-height))))))
+
+(defun flamegraph--svg-label (name width font-size)
+  "Return NAME truncated to fit WIDTH pixels in the SVG renderer.
+FONT-SIZE is the SVG label font size in pixels."
   (let* ((available (- width flamegraph-text-padding))
-         (char-px (max 1 (ceiling (* flamegraph-svg-font-size 0.6))))
+         (char-px (max 1 (ceiling (* font-size 0.6))))
          (columns (/ (max 0 available) char-px)))
     (truncate-string-to-width name columns)))
 
@@ -339,7 +355,8 @@ Each element has the form (X0 Y0 X1 Y1 FRAME).")
   "Draw FRAMES as one SVG image in the current buffer.
 MAX-DEPTH is the deepest row."
   (let* ((total-px (flamegraph--canvas-width))
-         (row-height flamegraph-svg-frame-height)
+         (font-size (flamegraph--svg-font-size))
+         (row-height (max flamegraph-svg-frame-height (+ font-size 5)))
          (height (* (1+ max-depth) row-height))
          (svg (svg-create total-px height))
          (rows (make-vector (1+ max-depth) nil))
@@ -361,7 +378,7 @@ MAX-DEPTH is the deepest row."
                               (profiler-calltree-entry node)))
                        (color (flamegraph--color name))
                        (width (- x1 x0))
-                       (label (flamegraph--svg-label name width)))
+                       (label (flamegraph--svg-label name width font-size)))
             (push (list x0 y x1 (+ y row-height) frame) hitboxes)
             (push (list (cons 'rect (cons (cons x0 y)
                                           (cons x1 (+ y row-height))))
@@ -378,8 +395,8 @@ MAX-DEPTH is the deepest row."
               (svg-text svg label
                         :x (+ x0 flamegraph-text-padding)
                         :y (+ y (floor (+ (/ row-height 2)
-                                          (/ flamegraph-svg-font-size 3))))
-                        :font-size flamegraph-svg-font-size
+                                          (/ font-size 3))))
+                        :font-size font-size
                         :font-family "sans-serif"
                         :fill "black"))))))
     (setq hitboxes (vconcat (nreverse hitboxes))
