@@ -14,6 +14,16 @@
 # nm_offset - sub_offset. Works uniformly for PIE and non-PIE binaries without
 # having to detect ELF type.
 #
+# Requirements:
+#   - perl, bash, perf, nm, addr2line
+#   - Linux 4.8+ (assumes modern `perf script` output: symbol+offset on every
+#     frame, parenthesized DSO path)
+#
+# Missing features (vs stackcollapse-perf.pl):
+#   - JIT runtimes: no `/tmp/perf-<pid>.map` handling, no Java method-name tidy
+#   - Annotations: no `_[k]` / `_[j]` / `_[i]` suffixes for kernel / JIT / inline
+#   - Filters: no `--event-filter`, no `--pid` / `--tid` inclusion in comm
+#
 # Caveats:
 #
 #   - Stripped binaries (e.g. libc.so.6 on stock distros) fall through to bare
