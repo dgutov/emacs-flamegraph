@@ -61,6 +61,10 @@ perf script --max-stack 512 -i "$DATA" 2>/dev/null > "$TMP/raw.txt"
 perl - "$TMP" "$TMP/raw.txt" <<'PERL'
 use strict;
 use warnings;
+# Suppress "Hexadecimal number > 0xffffffff non-portable" warnings: addresses
+# from PIE binaries routinely exceed 32 bits, but Perl on 64-bit handles them
+# correctly.
+no warnings 'portable';
 
 my ($tmp, $raw) = @ARGV;
 
