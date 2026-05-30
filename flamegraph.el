@@ -104,6 +104,10 @@ If nil, derive it from the current frame's default character height."
   "Corner radius of SVG frame rectangles, in pixels."
   :type 'natnum)
 
+(defcustom flamegraph-svg-hover-delay 0.01
+  "Delay in seconds before highlighting the SVG frame under the mouse."
+  :type 'number)
+
 ;;; Layout: call tree -> flat list of frames
 
 (cl-defstruct (flamegraph-frame
@@ -322,11 +326,21 @@ MAX-DEPTH is the deepest row."
   "Vector of SVG hit boxes, sorted in navigation order.
 Each element has the form (X0 Y0 X1 Y1 FRAME).")
 
-(defvar-local flamegraph--current-frame nil
-  "Currently selected frame when using the SVG renderer.")
-
 (defvar-local flamegraph--current-frame-index 0
-  "Index of `flamegraph--current-frame' in `flamegraph--svg-hitboxes'.")
+  "Index of the current SVG frame in `flamegraph--svg-hitboxes'.")
+
+(defun flamegraph--svg-current-frame ()
+  "Return the current SVG frame, or nil."
+  (when (and (>= flamegraph--current-frame-index 0)
+             (< flamegraph--current-frame-index
+                (length flamegraph--svg-hitboxes)))
+    (nth 4 (aref flamegraph--svg-hitboxes
+                 flamegraph--current-frame-index))))
+
+(defvar-local flamegraph--svg-state nil
+  "State for the SVG renderer.
+A plist with :rows, :width, :row-height, :font-size, :hover-frame,
+and :hover-timer.  Each row is [DEPTH Y SEGS POS].")
 
 (defun flamegraph--svg-font-size ()
   "Return the SVG label font size in pixels."
@@ -362,6 +376,67 @@ FONT-SIZE is the SVG label font size in pixels."
        (?\" "&quot;")))
    string t t))
 
+(defun flamegraph--svg-row-image (row highlighted-frame)
+  "Return an SVG image for ROW, highlighting HIGHLIGHTED-FRAME."
+  (let* ((depth (aref row 0))
+         (segs (aref row 2))
+         (total-px (plist-get flamegraph--svg-state :width))
+         (row-height (plist-get flamegraph--svg-state :row-height))
+         (font-size (plist-get flamegraph--svg-state :font-size))
+         (svg-parts
+          (list (format "<svg width=\"%d\" height=\"%d\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\">"
+                        total-px row-height)))
+         (row-map nil)
+         highlight)
+    (dolist (seg segs)
+      (pcase-let* ((`(,x0 ,x1 ,frame) seg)
+                   (node (flamegraph-frame-node frame))
+                   (name (flamegraph--entry-name
+                          (profiler-calltree-entry node)))
+                   (color (flamegraph--color name))
+                   (width (- x1 x0))
+                   (label (flamegraph--svg-label name width font-size)))
+        (push (list (cons 'rect (cons (cons x0 0) (cons x1 row-height)))
+                    'flamegraph-svg-frame
+                    (list 'help-echo
+                          (lambda (window _object _pos)
+                            (flamegraph--svg-schedule-hover
+                             frame depth
+                             (if (window-live-p window)
+                                 (window-buffer window)
+                               (current-buffer)))
+                            (flamegraph--frame-help frame))
+                          'pointer 'hand))
+              row-map)
+        (push (format "<rect x=\"%d\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"%s\" rx=\"%d\" ry=\"%d\"/>"
+                      x0 width (1- row-height) color
+                      flamegraph-svg-frame-radius
+                      flamegraph-svg-frame-radius)
+              svg-parts)
+        (unless (string-empty-p label)
+          (push (format "<text x=\"%d\" y=\"%d\" font-size=\"%d\" font-family=\"sans-serif\" fill=\"black\">%s</text>"
+                        (+ x0 flamegraph-text-padding)
+                        (floor (+ (/ row-height 2) (/ font-size 3)))
+                        font-size
+                        (flamegraph--svg-escape label))
+                svg-parts))
+        (when (eq (flamegraph-frame-node frame)
+                  (and highlighted-frame
+                       (flamegraph-frame-node highlighted-frame)))
+          (setq highlight (list x0 width)))))
+    (when highlight
+      (pcase-let ((`(,x0 ,width) highlight))
+        (push (format "<rect x=\"%d\" y=\"1\" width=\"%d\" height=\"%d\" fill=\"none\" stroke=\"#1f6feb\" stroke-width=\"2\" rx=\"%d\" ry=\"%d\"/>"
+                      (1+ x0) (max 1 (- width 2))
+                      (max 1 (- row-height 3))
+                      flamegraph-svg-frame-radius
+                      flamegraph-svg-frame-radius)
+              svg-parts)))
+    (push "</svg>" svg-parts)
+    (create-image (apply #'concat (nreverse svg-parts))
+                  'svg t :ascent 'center
+                  :scale 1.0 :map row-map)))
+
 (defun flamegraph--render-svg (frames max-depth)
   "Draw FRAMES as SVG images in the current buffer.
 MAX-DEPTH is the deepest row."
@@ -369,7 +444,18 @@ MAX-DEPTH is the deepest row."
          (font-size (flamegraph--svg-font-size))
          (row-height (max flamegraph-svg-frame-height (+ font-size 5)))
          (rows (make-vector (1+ max-depth) nil))
-         row-images image-map hitboxes current current-index positions)
+         (old-frame (flamegraph--svg-current-frame))
+         (old-node (and old-frame (flamegraph-frame-node old-frame)))
+         row-images hitboxes current-index positions)
+    (when-let* ((timer (plist-get flamegraph--svg-state :hover-timer))
+                ((timerp timer)))
+      (cancel-timer timer))
+    (setq flamegraph--svg-state
+          (list :width total-px
+                :row-height row-height
+                :font-size font-size
+                :hover-frame nil
+                :hover-timer nil))
     (dolist (frame frames)
       (let ((x0 (round (* (flamegraph-frame-start frame) total-px)))
             (x1 (round (* (+ (flamegraph-frame-start frame)
@@ -379,73 +465,44 @@ MAX-DEPTH is the deepest row."
           (push (list x0 x1 frame)
                 (aref rows (flamegraph-frame-depth frame))))))
     (dotimes (depth (1+ max-depth))
-      (let ((svg-parts
-             (list (format "<svg width=\"%d\" height=\"%d\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\">"
-                           total-px row-height)))
-            (row-map nil)
+      (let ((segs (sort (aref rows depth) :key #'car))
             (y (* depth row-height)))
-        (dolist (seg (sort (aref rows depth) :key #'car))
-          (pcase-let* ((`(,x0 ,x1 ,frame) seg)
-                       (node (flamegraph-frame-node frame))
-                       (name (flamegraph--entry-name
-                              (profiler-calltree-entry node)))
-                       (color (flamegraph--color name))
-                       (width (- x1 x0))
-                       (label (flamegraph--svg-label name width font-size)))
-            (push (list x0 y x1 (+ y row-height) frame) hitboxes)
-            (push (list (cons 'rect (cons (cons x0 0)
-                                          (cons x1 row-height)))
-                        'flamegraph-svg-frame
-                        (list 'help-echo (flamegraph--frame-help frame)
-                              'pointer 'hand))
-                  row-map)
-            (push (format "<rect x=\"%d\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"%s\" rx=\"%d\" ry=\"%d\"/>"
-                          x0 width (1- row-height) color
-                          flamegraph-svg-frame-radius
-                          flamegraph-svg-frame-radius)
-                  svg-parts)
-            (unless (string-empty-p label)
-              (push (format "<text x=\"%d\" y=\"%d\" font-size=\"%d\" font-family=\"sans-serif\" fill=\"black\">%s</text>"
-                            (+ x0 flamegraph-text-padding)
-                            (floor (+ (/ row-height 2) (/ font-size 3)))
-                            font-size
-                            (flamegraph--svg-escape label))
-                    svg-parts))))
-        (push "</svg>" svg-parts)
-        (push (list depth y
-                    (create-image (apply #'concat (nreverse svg-parts))
-                                  'svg t :ascent 'center
-                                  :scale 1.0 :map row-map))
-              row-images)))
+        (let ((row (vector depth y segs nil)))
+          (aset rows depth row)
+          (dolist (seg segs)
+            (pcase-let ((`(,x0 ,x1 ,frame) seg))
+              (push (list x0 y x1 (+ y row-height) frame) hitboxes)))
+          (push (list row (flamegraph--svg-row-image row nil))
+                row-images))))
     (setq hitboxes (vconcat (nreverse hitboxes))
           flamegraph--svg-hitboxes hitboxes)
+    (setq flamegraph--svg-state
+          (plist-put flamegraph--svg-state :rows rows))
     (when (> (length hitboxes) 0)
-      (let ((old-node (and flamegraph--current-frame
-                           (flamegraph-frame-node flamegraph--current-frame))))
+      (when old-node
         (cl-loop for hit across hitboxes
                  for i from 0
                  when (eq (flamegraph-frame-node (nth 4 hit)) old-node)
-                 do (setq current (nth 4 hit)
-                          current-index i))
-        (unless current
-          (setq current (nth 4 (aref hitboxes 0))
-                current-index 0))))
-    (setq flamegraph--current-frame current
-          flamegraph--current-frame-index (or current-index 0))
-    (dolist (row (nreverse row-images))
-      (pcase-let ((`(,depth ,y ,image) row))
-        (push (point) positions)
-        (insert (propertize " "
-                            'display image
-                            'flamegraph-frame current
-                            'flamegraph-svg-depth depth
-                            'flamegraph-svg-y-offset y
-                            'help-echo #'flamegraph--help-echo))
-        (insert "\n")))
+                 do (setq current-index i)))
+      (unless current-index
+        (setq current-index 0)))
+    (setq flamegraph--current-frame-index (or current-index 0))
+    (let ((current (flamegraph--svg-current-frame)))
+      (dolist (entry (nreverse row-images))
+        (pcase-let ((`(,row ,image) entry))
+          (push (point) positions)
+          (aset row 3 (point))
+          (insert (propertize " "
+                              'display image
+                              'flamegraph-frame current
+                              'flamegraph-svg-depth (aref row 0)
+                              'flamegraph-svg-y-offset (aref row 1)
+                              'help-echo #'flamegraph--help-echo))
+          (insert "\n"))))
     (setq flamegraph--frame-positions (vconcat (nreverse positions)))))
 
-(defun flamegraph--svg-frame-at-event (event)
-  "Return the SVG frame clicked by EVENT, or nil."
+(defun flamegraph--svg-hit-at-event (event)
+  "Return (FRAME INDEX DEPTH) for SVG EVENT, or nil."
   (when (eq flamegraph-renderer 'svg)
     (let* ((posn (event-end event))
            (xy (and (posnp posn) (posn-object-x-y posn))))
@@ -456,28 +513,85 @@ MAX-DEPTH is the deepest row."
                            0))
                (x (car xy))
                (y (+ y-offset (cdr xy)))
-               found found-index)
+               found)
           (cl-loop for hit across flamegraph--svg-hitboxes
                    for i from 0
                    until found
                    do (pcase-let ((`(,x0 ,y0 ,x1 ,y1 ,frame) hit))
                         (when (and (<= x0 x) (< x x1)
                                    (<= y0 y) (< y y1))
-                          (setq found frame
-                                found-index i))))
-          (when found
-            (setq flamegraph--current-frame found
-                  flamegraph--current-frame-index found-index))
+                          (setq found (list frame i
+                                            (flamegraph-frame-depth frame))))))
           found)))))
+
+(defun flamegraph--svg-frame-at-event (event)
+  "Return the SVG frame clicked by EVENT, or nil."
+  (pcase (flamegraph--svg-hit-at-event event)
+    (`(,frame ,index ,_depth)
+     (setq flamegraph--current-frame-index index)
+     frame)))
+
+(defun flamegraph--svg-redraw-row (depth highlighted-frame)
+  "Redraw SVG row DEPTH, highlighting HIGHLIGHTED-FRAME."
+  (when-let* ((rows (plist-get flamegraph--svg-state :rows))
+              ((and (>= depth 0) (< depth (length rows))))
+              (row (aref rows depth))
+              (pos (aref row 3))
+              ((integerp pos)))
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t)
+          (image (flamegraph--svg-row-image row highlighted-frame)))
+      (put-text-property pos (1+ pos) 'display image)
+      (force-window-update (current-buffer)))))
+
+(defun flamegraph--svg-apply-hover (buffer frame depth)
+  "Apply delayed SVG hover highlight in BUFFER for FRAME at DEPTH."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq flamegraph--svg-state
+            (plist-put flamegraph--svg-state :hover-timer nil))
+      (when (eq flamegraph-renderer 'svg)
+        (let ((old-frame (plist-get flamegraph--svg-state :hover-frame)))
+          (unless (eq (and frame (flamegraph-frame-node frame))
+                      (and old-frame (flamegraph-frame-node old-frame)))
+            (setq flamegraph--svg-state
+                  (plist-put flamegraph--svg-state :hover-frame frame))
+            (when old-frame
+              (flamegraph--svg-redraw-row (flamegraph-frame-depth old-frame) nil))
+            (when (and frame (integerp depth))
+              (flamegraph--svg-redraw-row depth frame))))))))
+
+(defun flamegraph--svg-schedule-hover (frame depth &optional buffer)
+  "Schedule delayed SVG hover highlighting for FRAME at DEPTH.
+Use BUFFER, or the current buffer if BUFFER is nil."
+  (let ((buffer (or buffer (current-buffer))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when-let* ((timer (plist-get flamegraph--svg-state :hover-timer))
+                    ((timerp timer)))
+          (cancel-timer timer))
+        (setq flamegraph--svg-state
+              (plist-put flamegraph--svg-state :hover-timer
+                         (run-at-time flamegraph-svg-hover-delay nil
+                                      #'flamegraph--svg-apply-hover
+                                      buffer frame depth)))))))
+
+(defun flamegraph--svg-stop-hover ()
+  "Stop pending SVG hover timer in the current buffer."
+  (when-let* ((timer (plist-get flamegraph--svg-state :hover-timer))
+              ((timerp timer)))
+    (cancel-timer timer)
+    (setq flamegraph--svg-state
+          (plist-put flamegraph--svg-state :hover-timer nil))))
+
 
 (defun flamegraph--svg-goto (next)
   "Move to the next SVG frame, or the previous one if NEXT is nil."
   (let* ((len (length flamegraph--svg-hitboxes))
          (index (+ flamegraph--current-frame-index (if next 1 -1))))
     (if (and (>= index 0) (< index len))
-        (let ((frame (nth 4 (aref flamegraph--svg-hitboxes index))))
-          (setq flamegraph--current-frame frame
-                flamegraph--current-frame-index index)
+        (progn
+          (setq flamegraph--current-frame-index index)
           (flamegraph--echo))
       (message "No %s frame" (if next "next" "previous")))))
 
@@ -536,7 +650,7 @@ If POINT is non-nil, restore point there after drawing."
                  (flamegraph--frames root)))
       (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
           (flamegraph--render-svg frames max-depth)
-        (setq flamegraph--current-frame nil
+        (setq flamegraph--current-frame-index 0
               flamegraph--svg-hitboxes nil)
         (flamegraph--render-text frames max-depth)))
     (setq header-line-format (flamegraph--header))
@@ -553,7 +667,7 @@ If POINT is non-nil, restore point there after drawing."
 (defun flamegraph--frame-at-point ()
   "Return the `flamegraph-frame' at point, or nil."
   (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
-      flamegraph--current-frame
+      (flamegraph--svg-current-frame)
     (get-text-property (point) 'flamegraph-frame)))
 
 (defun flamegraph--view-state ()
@@ -906,7 +1020,8 @@ since this runs before that relocation happens."
         truncate-lines t
         buffer-undo-list t
         left-fringe-width 0)
-  (unless (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+  (if (and (eq flamegraph-renderer 'svg) (display-graphic-p))
+      (add-hook 'kill-buffer-hook #'flamegraph--svg-stop-hover nil t)
     (cursor-intangible-mode 1))
   (add-hook 'post-command-hook #'flamegraph--echo nil t))
 
