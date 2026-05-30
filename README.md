@@ -126,6 +126,15 @@ resolution can be slow on deep-callchain profiles. Processing time may
 improve with `--no-inline` if inline expansion is costly, at the cost of
 omitting inlined frames.
 
+For a faster path, [`scripts/perf-fold.sh`](scripts/perf-fold.sh) calls
+`addr2line` directly per DSO — same folded output, ~100x faster in
+some Emacs tests. Stripped libraries (e.g. libc) get bare function
+names instead of full srclines.
+
+```sh
+scripts/perf-fold.sh out.perf.data > out.folded
+```
+
 For faster report generation without source locations, omit `-F +srcline`,
 `--full-source-path`, and `--srcline` altogether.
 
