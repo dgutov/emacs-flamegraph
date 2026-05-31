@@ -87,7 +87,7 @@ the data file the graph was loaded from."
 (defcustom flamegraph-renderer 'text
   "Renderer used to draw flame graphs.
 The text renderer is interactive on graphical and text terminals.  The
-SVG renderer draws one image and is intended for graphical displays."
+SVG renderer draws one image per row and is intended for graphical displays."
   :type '(choice (const :tag "Text" text)
                  (const :tag "SVG image" svg)))
 
@@ -487,18 +487,15 @@ MAX-DEPTH is the deepest row."
       (unless current-index
         (setq current-index 0)))
     (setq flamegraph--current-frame-index (or current-index 0))
-    (let ((current (flamegraph--svg-current-frame)))
-      (dolist (entry (nreverse row-images))
-        (pcase-let ((`(,row ,image) entry))
+    (dolist (entry (nreverse row-images))
+      (pcase-let ((`(,row ,image) entry))
           (push (point) positions)
           (aset row 3 (point))
           (insert (propertize " "
                               'display image
-                              'flamegraph-frame current
                               'flamegraph-svg-depth (aref row 0)
-                              'flamegraph-svg-y-offset (aref row 1)
-                              'help-echo #'flamegraph--help-echo))
-          (insert "\n"))))
+                              'flamegraph-svg-y-offset (aref row 1)))
+        (insert "\n")))
     (setq flamegraph--frame-positions (vconcat (nreverse positions)))))
 
 (defun flamegraph--svg-hit-at-event (event)

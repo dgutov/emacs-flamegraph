@@ -14,24 +14,24 @@
 
 (defmacro flamegraph-tests--with-svg-buffer (&rest body)
   (declare (indent 0) (debug t))
-  `(with-temp-buffer
-     (flamegraph-mode)
-     (setq flamegraph--top (flamegraph-tests--calltree)
-           flamegraph--grand-total 15
-           flamegraph--unit "samples"
-           flamegraph--title "test")
-     (let ((flamegraph-renderer 'svg)
-           (flamegraph-width 100)
-           (flamegraph-svg-hover-delay 0))
-       (cl-letf (((symbol-function 'display-graphic-p)
-                  (lambda (&optional _frame) t))
-                 ((symbol-function 'frame-char-width)
-                  (lambda (&optional _frame) 1))
-                 ((symbol-function 'create-image)
-                  (lambda (data type data-p &rest props)
-                    (append (list 'image :type type
-                                  :data-p data-p :data data)
-                            props))))
+  `(let ((flamegraph-renderer 'svg)
+         (flamegraph-width 100)
+         (flamegraph-svg-hover-delay 0))
+     (cl-letf (((symbol-function 'display-graphic-p)
+                (lambda (&optional _frame) t))
+               ((symbol-function 'frame-char-width)
+                (lambda (&optional _frame) 1))
+               ((symbol-function 'create-image)
+                (lambda (data type data-p &rest props)
+                  (append (list 'image :type type
+                                :data-p data-p :data data)
+                          props))))
+       (with-temp-buffer
+         (flamegraph-mode)
+         (setq flamegraph--top (flamegraph-tests--calltree)
+               flamegraph--grand-total 15
+               flamegraph--unit "samples"
+               flamegraph--title "test")
          ,@body))))
 
 (defun flamegraph-tests--frame-names ()
